@@ -27,13 +27,12 @@ function getPackagedBackendArchDir() {
   // Layout inside resources:
   //   resources/python-backend/darwin-arm64/mlav3-backend/mlav3-backend
   //   resources/python-backend/darwin-x64/mlav3-backend/mlav3-backend
-  // Later we can extend for win32/linux similarly.
+  // For win32/linux, there is no arch subdirectory; the backend is placed directly.
   if (process.platform === 'darwin') {
     if (process.arch === 'arm64') return 'darwin-arm64';
     if (process.arch === 'x64') return 'darwin-x64';
   }
-  // Fallback: use platform-arch
-  return `${process.platform}-${process.arch}`;
+  return '';
 }
 
 function getPackagedBackendExecutablePath() {

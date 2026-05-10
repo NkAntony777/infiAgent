@@ -505,6 +505,13 @@ class AgentExecutor:
         if not self.action_history:
             return messages
 
+        safe_print(f"   📨 构建消息时 action_history 长度: {len(self.action_history)}")
+        for _ai, _a in enumerate(self.action_history):
+            _tn = _a.get("tool_name", "?")
+            _res = _a.get("result", {})
+            _out = _res.get("output", "") if isinstance(_res, dict) else ""
+            safe_print(f"       [{_ai}] tool={_tn}, result_output_len={len(str(_out))}")
+
         use_kimi_history_tool_ids = self._should_normalize_kimi_history_tool_ids()
         history_tool_call_index = 0
 
@@ -1372,10 +1379,10 @@ class AgentExecutor:
                 task_input=self.current_task_input
             )
 
-            # 如果发生了压缩，替换
-            if len(compressed) < original_len:
+            # compress_if_needed 返回原始引用表示未压缩，返回新 list 表示已压缩
+            if compressed is not self.action_history:
                 self.event_emitter.dispatch(CliDisplayEvent(
-                    message=f"✅ 历史动作已压缩: {original_len}条 → {len(compressed)}条", 
+                    message=f"✅ 历史动作已压缩: {original_len}条 → {len(compressed)}条",
                     style='success'
                 ))
                 self.action_history = compressed

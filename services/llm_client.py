@@ -910,11 +910,26 @@ class SimpleLLMClient:
             # 只在max_tokens > 0时添加
             if max_tokens > 0:
                 kwargs["max_tokens"] = max_tokens
-            
+
             # 添加工具定义（只有当工具列表非空时才添加工具相关参数）
             if tools_definition:
                 # 工具列表非空：正常添加工具参数
                 kwargs["tools"] = tools_definition
+
+                # ---- 诊断日志：测量实际请求大小 ----
+                try:
+                    import json as _json
+                    _msgs_str = _json.dumps(messages, ensure_ascii=False)
+                    _tools_str = _json.dumps(tools_definition, ensure_ascii=False)
+                    _total_chars = len(_msgs_str) + len(_tools_str) + len(system_prompt)
+                    safe_print(f"   📏 请求大小估算: messages={len(_msgs_str)} chars, tools={len(_tools_str)} chars, system={len(system_prompt)} chars, total={_total_chars} chars (~{_total_chars // 3} tokens)")
+                    for _i, _t in enumerate(tools_definition):
+                        _tname = _t.get("function", {}).get("name", "?")
+                        _tstr = _json.dumps(_t, ensure_ascii=False)
+                        safe_print(f"      工具[{_i}] {_tname}: {len(_tstr)} chars")
+                except Exception:
+                    pass
+                # ------------------------------------
                 if tool_choice == "required":
                     kwargs["tool_choice"] = "required"
                 kwargs["parallel_tool_calls"] = False
@@ -1442,6 +1457,7 @@ class SimpleLLMClient:
             "unknown model",
             "context length",
             "maximum context length",
+            "context window",
             "prompt is too long",
             "content policy",
             "safety system",

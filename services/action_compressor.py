@@ -103,11 +103,14 @@ class ActionCompressor:
         total_text = self._actions_to_xml(action_history)
         total_tokens = self.count_tokens(total_text+thinking+task_input)
         
+        # 系统提示词+工具定义等额外开销约占 50000 tokens，提前触发压缩
+        _overhead_buffer = 50000
+
         # 如果不超限，不压缩
-        if total_tokens <= max_context_window - 20000:
+        if total_tokens <= max_context_window - _overhead_buffer:
             return action_history
-        
-        safe_print(f"🔄 历史动作需要压缩: {total_tokens} tokens > {max_context_window - 20000}")
+
+        safe_print(f"🔄 历史动作需要压缩: {total_tokens} tokens > {max_context_window - _overhead_buffer}")
         
         # 压缩策略：
         # 1. 历史 → 基于 thinking 和 task_input 智能总结为5k tokens
@@ -369,25 +372,36 @@ class ActionCompressor:
         # 简单方法：按 </action> 分割
         action_blocks = xml_text.split('</action>')
         action_blocks = [block + '</action>' for block in action_blocks if block.strip()]
-        
-        # 将actions分组到chunks中
+
+        # 将actions分组到chunks中，chunk_size_tokens 已由调用方根据模型上下文窗口动态计算
         chunks = []
         current_chunk = []
         current_chunk_tokens = 0
-        
+
         for action_block in action_blocks:
             action_tokens = self.count_tokens(action_block)
-            
+
+            # 如果单个 action 超过 chunk 大小，按字符强制切割（避免整个 chunk 过大）
+            if action_tokens > chunk_size_tokens:
+                if current_chunk:
+                    chunks.append('\n\n'.join(current_chunk))
+                    current_chunk = []
+                    current_chunk_tokens = 0
+                # 按字符数切分（~3 chars/token 粗略估计）
+                chars_per_chunk = chunk_size_tokens * 3
+                for i in range(0, len(action_block), chars_per_chunk):
+                    sub_block = action_block[i:i + chars_per_chunk]
+                    chunks.append(sub_block)
+                continue
+
             if current_chunk_tokens + action_tokens > chunk_size_tokens and current_chunk:
-                # 当前chunk已满，开始新chunk
                 chunks.append('\n\n'.join(current_chunk))
                 current_chunk = [action_block]
                 current_chunk_tokens = action_tokens
             else:
                 current_chunk.append(action_block)
                 current_chunk_tokens += action_tokens
-        
-        # 添加最后一个chunk
+
         if current_chunk:
             chunks.append('\n\n'.join(current_chunk))
         
@@ -522,7 +536,9 @@ class ActionCompressor:
         if "result" in compressed_action and "output" in compressed_action["result"]:
             output = compressed_action["result"]["output"]
             output_tokens = self.count_tokens(output)
-            
+            output_chars = len(str(output))
+            safe_print(f"   🔍 检查result.output: {output_tokens} tokens, {output_chars} chars, 阈值={max_field_tokens} tokens, tool={action.get('tool_name')}")
+
             if output_tokens > max_field_tokens:
                 safe_print(f"   🤖 LLM压缩result.output: {output_tokens} tokens → {max_field_tokens} tokens")
                 # 构建字段上下文（包含工具参数信息）
