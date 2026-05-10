@@ -312,6 +312,12 @@ class FileWriteTool(BaseTool):
         """
         try:
             path = parameters.get("path")
+            if not path:
+                return {
+                    "status": "error",
+                    "output": "",
+                    "error": "缺少必填参数 'path'：请指定要写入的文件路径"
+                }
             content = parameters.get("content", "")
             mode = parameters.get("mode", "write")
             start_line = parameters.get("start_line")
