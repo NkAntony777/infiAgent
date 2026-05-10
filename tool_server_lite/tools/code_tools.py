@@ -1112,10 +1112,44 @@ class ExecuteCommandTool(BaseTool):
             "error": "",
         }
     
+    def _run_with_timeout_windows(self, command: str, timeout: int, cwd: Path) -> Dict[str, Any]:
+        """Windows: Popen + taskkill process tree, ensures child processes are killed on timeout"""
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = process.communicate(timeout=timeout)
+            output = stdout or ""
+            if process.returncode != 0:
+                output += f"\nExit code: {process.returncode}"
+            return {"status": "success", "output": output, "error": ""}
+        except subprocess.TimeoutExpired:
+            try:
+                subprocess.run(
+                    f"taskkill /F /T /PID {process.pid}",
+                    shell=True,
+                    capture_output=True,
+                    timeout=5,
+                    stdin=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+            try:
+                process.kill()
+            except Exception:
+                pass
+            return {"status": "error", "output": "", "error": f"Command timeout ({timeout}s)"}
+
     def execute(self, task_id: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """
         执行安全的只读命令
-        
+
         Parameters:
             command (str): 要执行的命令（仅限白名单中的安全命令）
             working_dir (str, optional): 工作目录相对路径，默认为workspace根目录
@@ -1277,6 +1311,13 @@ class ExecuteCommandTool(BaseTool):
                     return {"status": "success", "output": output, "error": ""}
 
             # 不重定向：直接捕获输出
+            # Windows 上 shell=True 的子进程树可能不会被 timeout 杀掉（如 powershell 子进程），
+            # 使用 Popen + 手动读取 + 进程树终止的方式确保超时生效
+            if sys.platform == "win32":
+                return self._run_with_timeout_windows(
+                    command, timeout, abs_working_dir
+                )
+
             result = subprocess.run(
                 command,
                 shell=True,
@@ -1294,7 +1335,7 @@ class ExecuteCommandTool(BaseTool):
                 output += f"\nExit code: {result.returncode}"
 
             return {"status": "success", "output": output, "error": ""}
-            
+
         except subprocess.TimeoutExpired:
             return {
                 "status": "error",
