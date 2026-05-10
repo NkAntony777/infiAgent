@@ -103,8 +103,8 @@ class ActionCompressor:
         total_text = self._actions_to_xml(action_history)
         total_tokens = self.count_tokens(total_text+thinking+task_input)
         
-        # 系统提示词+工具定义等额外开销约占 50000 tokens，提前触发压缩
-        _overhead_buffer = 50000
+        # 系统提示词(~2K) + 工具定义(~3.5K) + 杂项 overhead，留 15K 余量
+        _overhead_buffer = 15000
 
         # 如果不超限，不压缩
         if total_tokens <= max_context_window - _overhead_buffer:
