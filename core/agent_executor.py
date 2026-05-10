@@ -332,6 +332,11 @@ class AgentExecutor:
                                     message=f"⚠️ LLM未调用工具，第{max_tool_try}/{self.no_tool_retry_limit}次提醒",
                                     style='warning'
                                 ))
+                                # 移除旧的 _no_tool_call，避免噪声积累（只保留最新一条）
+                                self.action_history = [
+                                    a for a in self.action_history
+                                    if a.get("tool_name") != "_no_tool_call"
+                                ]
                                 self.action_history.append({
                                     "_turn": self.llm_turn_counter,
                                     "tool_name": "_no_tool_call",
