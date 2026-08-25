@@ -3,17 +3,18 @@ from utils.windows_compat import safe_print
 # -*- coding: utf-8 -*-
 """
 历史动作压缩服务
-策略：总结历史XML + 保留最新action + 压缩最新action的大字段
+策略：总结历史XML + 保留最新action + 压缩最新action的大字段。
+
+注意：
+- 预算统计必须覆盖 assistant_content / reasoning_content，
+  否则 ReAct / thinking 文本会逃逸上下文预算。
 """
 
+import copy
 import json
 from typing import List, Dict, Optional
 
-try:
-    import tiktoken
-    HAS_TIKTOKEN = True
-except ImportError:
-    HAS_TIKTOKEN = False
+from utils.token_budget import count_tokens_text
 
 
 class ActionCompressor:
@@ -41,11 +42,7 @@ class ActionCompressor:
         self.max_tokens = max_tokens
         self.debug_task_id = debug_task_id
         
-        # 初始化tiktoken
-        if HAS_TIKTOKEN:
-            self.encoding = tiktoken.get_encoding("cl100k_base")
-        else:
-            self.encoding = None
+        self.encoding = None
 
     def _resolve_compressor_model(self) -> str:
         return self.llm_client.resolve_model("compressor", self.preferred_model)
@@ -55,12 +52,17 @@ class ActionCompressor:
     
     def count_tokens(self, text: str) -> int:
         """统计token数"""
-        if self.encoding:
-            return len(self.encoding.encode(text))
-        else:
-            chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
-            other_chars = len(text) - chinese_chars
-            return int(chinese_chars / 1.5 + other_chars / 4)
+        return count_tokens_text(str(text or ""))
+
+    def count_action_context_tokens(
+        self,
+        action_history: List[Dict],
+        *,
+        thinking: str = "",
+        task_input: str = "",
+    ) -> int:
+        serialized = self._actions_to_xml(action_history)
+        return self.count_tokens(serialized + str(thinking or "") + str(task_input or ""))
     
     def compress_if_needed(
         self,
@@ -68,7 +70,9 @@ class ActionCompressor:
         max_context_window: int,
         thinking: str = "",
         task_input: str = "",
-        save_callback=None  # 添加保存回调，确保压缩后立即保存
+        save_callback=None,  # 添加保存回调，确保压缩后立即保存
+        max_action_tokens: Optional[int] = None,
+        force: bool = False,
     ) -> List[Dict]:
         """
         检查并压缩历史动作
@@ -93,42 +97,60 @@ class ActionCompressor:
         # 如果只有一条
         if len(action_history) == 1:
             # 检查是否需要压缩字段
-            return [self._compress_action_fields(action_history[0], max_context_window // 2)]
+            single_budget = max(256, int(max_action_tokens or max_context_window // 2))
+            return [self._compress_action_fields(
+                action_history[0],
+                single_budget,
+                thinking=thinking,
+                task_input=task_input,
+                max_context_window=max_context_window,
+            )]
         
         # 分离最新和历史
         recent_action = action_history[-1]
         historical_actions = action_history[:-1]
         
         # 计算整体token数
-        total_text = self._actions_to_xml(action_history)
-        total_tokens = self.count_tokens(total_text+thinking+task_input)
-        
-        # 系统提示词(~2K) + 工具定义(~3.5K) + 杂项 overhead，留 15K 余量
-        _overhead_buffer = 15000
+        total_tokens = self.count_action_context_tokens(
+            action_history,
+            thinking=thinking,
+            task_input=task_input,
+        )
+
+        effective_budget = int(max_action_tokens) if max_action_tokens is not None else max(
+            1024,
+            max_context_window
+            - max(1024, min(4096, int(max_context_window * 0.15)))
+            - max(512, min(4096, int(max_context_window * 0.05))),
+        )
 
         # 如果不超限，不压缩
-        if total_tokens <= max_context_window - _overhead_buffer:
+        if total_tokens <= effective_budget and not force:
             return action_history
-
-        safe_print(f"🔄 历史动作需要压缩: {total_tokens} tokens > {max_context_window - _overhead_buffer}")
+        
+        reason = "强制压缩" if force and total_tokens <= effective_budget else "需要压缩"
+        safe_print(f"🔄 历史动作{reason}: {total_tokens} tokens > target {effective_budget}")
         
         # 压缩策略：
         # 1. 历史 → 基于 thinking 和 task_input 智能总结为5k tokens
         # 2. 最新 → 压缩为max_window的50%
         
+        summary_target = max(256, min(5000, int(effective_budget * 0.35)))
+        recent_target = max(256, max(0, effective_budget - summary_target))
+
         summary_action = self._summarize_historical_xml(
             self._actions_to_xml(historical_actions),
-            target_tokens=5000,  # 历史总结固定5k tokens
+            target_tokens=summary_target,
             thinking=thinking,
             task_input=task_input,
             max_context_window=max_context_window,
             actions=historical_actions  # 传递原始 actions（用于提取图片）
         )
         
-        # 压缩最新action的大字段（50% of max_window）
+        # 压缩最新action的大字段（优先保留最近动作）
         compressed_recent = self._compress_action_fields(
             recent_action,
-            int(max_context_window * 0.5),  # 80000 * 0.5 = 40000 tokens
+            recent_target,
             thinking=thinking,
             task_input=task_input,
             max_context_window=max_context_window
@@ -150,8 +172,17 @@ class ActionCompressor:
             tool_name = action.get("tool_name", "")
             arguments = action.get("arguments", {})
             result = action.get("result", {})
+            assistant_content = str(action.get("assistant_content", "") or "")
+            reasoning_content = str(action.get("reasoning_content", "") or "")
             
             action_xml = f"<action>\n  <tool_name>{tool_name}</tool_name>\n"
+
+            if assistant_content:
+                escaped_content = assistant_content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                action_xml += f"  <assistant_content>{escaped_content}</assistant_content>\n"
+            if reasoning_content:
+                escaped_reasoning = reasoning_content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                action_xml += f"  <reasoning_content>{escaped_reasoning}</reasoning_content>\n"
             
             # 参数（跳过内部字段）
             for k, v in arguments.items():
@@ -372,36 +403,25 @@ class ActionCompressor:
         # 简单方法：按 </action> 分割
         action_blocks = xml_text.split('</action>')
         action_blocks = [block + '</action>' for block in action_blocks if block.strip()]
-
-        # 将actions分组到chunks中，chunk_size_tokens 已由调用方根据模型上下文窗口动态计算
+        
+        # 将actions分组到chunks中
         chunks = []
         current_chunk = []
         current_chunk_tokens = 0
-
+        
         for action_block in action_blocks:
             action_tokens = self.count_tokens(action_block)
-
-            # 如果单个 action 超过 chunk 大小，按字符强制切割（避免整个 chunk 过大）
-            if action_tokens > chunk_size_tokens:
-                if current_chunk:
-                    chunks.append('\n\n'.join(current_chunk))
-                    current_chunk = []
-                    current_chunk_tokens = 0
-                # 按字符数切分（~3 chars/token 粗略估计）
-                chars_per_chunk = chunk_size_tokens * 3
-                for i in range(0, len(action_block), chars_per_chunk):
-                    sub_block = action_block[i:i + chars_per_chunk]
-                    chunks.append(sub_block)
-                continue
-
+            
             if current_chunk_tokens + action_tokens > chunk_size_tokens and current_chunk:
+                # 当前chunk已满，开始新chunk
                 chunks.append('\n\n'.join(current_chunk))
                 current_chunk = [action_block]
                 current_chunk_tokens = action_tokens
             else:
                 current_chunk.append(action_block)
                 current_chunk_tokens += action_tokens
-
+        
+        # 添加最后一个chunk
         if current_chunk:
             chunks.append('\n\n'.join(current_chunk))
         
@@ -507,7 +527,9 @@ class ActionCompressor:
         Returns:
             压缩后的action
         """
-        compressed_action = action.copy()
+        # 必须深拷贝。浅拷贝会共享 nested result/arguments，
+        # 导致压缩直接改写原 action，外层无法判断压缩是否真的发生。
+        compressed_action = copy.deepcopy(action)
         
         # 压缩arguments中的大字段
         if "arguments" in compressed_action:
@@ -536,9 +558,7 @@ class ActionCompressor:
         if "result" in compressed_action and "output" in compressed_action["result"]:
             output = compressed_action["result"]["output"]
             output_tokens = self.count_tokens(output)
-            output_chars = len(str(output))
-            safe_print(f"   🔍 检查result.output: {output_tokens} tokens, {output_chars} chars, 阈值={max_field_tokens} tokens, tool={action.get('tool_name')}")
-
+            
             if output_tokens > max_field_tokens:
                 safe_print(f"   🤖 LLM压缩result.output: {output_tokens} tokens → {max_field_tokens} tokens")
                 # 构建字段上下文（包含工具参数信息）
@@ -557,6 +577,23 @@ class ActionCompressor:
                 compressed_action["result"]["output"] = compressed_output
                 compressed_action["result"]["_compressed"] = True
                 compressed_action["result"]["_original_tokens"] = output_tokens
+
+        for field_name in ("assistant_content", "reasoning_content"):
+            field_value = str(compressed_action.get(field_name, "") or "")
+            if not field_value:
+                continue
+            field_tokens = self.count_tokens(field_value)
+            if field_tokens > max_field_tokens:
+                safe_print(f"   🤖 LLM压缩{field_name}: {field_tokens} tokens → {max_field_tokens} tokens")
+                compressed_action[field_name] = self._llm_compress_field(
+                    field_value,
+                    max_field_tokens,
+                    action.get("tool_name", "unknown"),
+                    thinking=thinking,
+                    task_input=task_input,
+                    field_context=f"动作中的 {field_name}",
+                    max_context_window=max_context_window
+                )
         
         return compressed_action
     
