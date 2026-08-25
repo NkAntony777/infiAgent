@@ -11,6 +11,10 @@
   },
   "cheapclaw": {
     "watchdog_interval_sec": 10800,
+    "supervisor_timeout_sec": 900,
+    "outbox_max_retries": 10,
+    "outbox_backoff_base_sec": 30,
+    "outbox_backoff_cap_sec": 900,
     "default_exposed_skills": [
       "docx",
       "pptx",

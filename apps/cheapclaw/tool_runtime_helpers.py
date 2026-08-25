@@ -5,10 +5,74 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # POSIX
+    msvcrt = None
+
+
+PANEL_BACKUP_KEEP = 50
+
+
+def _lock_byte_range(lock_file, *, timeout_sec: float = 30.0) -> None:
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    while True:
+        lock_file.seek(0)
+        if msvcrt is not None:
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"panel lock busy after {timeout_sec}s: {get_panel_lock_path()}")
+                time.sleep(0.1)
+        elif fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            return
+        else:
+            return
+
+
+def _unlock_byte_range(lock_file) -> None:
+    lock_file.seek(0)
+    if msvcrt is not None:
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    elif fcntl is not None:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+
+def get_panel_lock_path() -> Path:
+    return get_cheapclaw_root() / "panel" / "panel.lock"
+
+
+@contextmanager
+def panel_file_lock(lock_path: Optional[Path] = None, timeout_sec: float = 30.0):
+    lock_file_path = Path(lock_path).expanduser().resolve() if lock_path else get_panel_lock_path()
+    lock_file_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_file_path, "a+", encoding="utf-8") as lock_file:
+        _lock_byte_range(lock_file, timeout_sec=timeout_sec)
+        try:
+            yield
+        finally:
+            _unlock_byte_range(lock_file)
 
 
 def now_iso() -> str:
@@ -114,8 +178,32 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 def _write_backup(path: Path, payload: str) -> Path:
     backup_path = get_panel_backups_dir() / f"panel_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
-    backup_path.write_text(payload, encoding="utf-8")
+    fd, tmp_name = tempfile.mkstemp(prefix=backup_path.name + ".", dir=str(backup_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(payload)
+        os.replace(tmp_name, backup_path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    prune_panel_backups(keep=PANEL_BACKUP_KEEP)
     return backup_path
+
+
+def prune_panel_backups(keep: int = PANEL_BACKUP_KEEP, backups_dir: Optional[Path] = None) -> int:
+    directory = Path(backups_dir) if backups_dir else get_panel_backups_dir()
+    try:
+        entries = sorted(directory.glob("panel_*.json"), key=lambda item: item.name)
+    except Exception:
+        return 0
+    removed = 0
+    for stale in entries[:-max(1, int(keep))] if len(entries) > max(1, int(keep)) else []:
+        try:
+            stale.unlink()
+            removed += 1
+        except Exception:
+            continue
+    return removed
 
 
 def slugify(value: str, fallback: str = "item", max_len: int = 80) -> str:
@@ -146,7 +234,7 @@ def load_panel() -> Dict[str, Any]:
         return {"version": 1, "channels": {}, "service_state": {}}
 
 
-def save_panel(panel: Dict[str, Any], backup: bool = True) -> Dict[str, Any]:
+def _save_panel_unlocked(panel: Dict[str, Any], backup: bool = True) -> Dict[str, Any]:
     ensure_cheapclaw_layout()
     if backup and get_panel_path().exists():
         backup_path = _write_backup(get_panel_path(), get_panel_path().read_text(encoding="utf-8"))
@@ -155,10 +243,16 @@ def save_panel(panel: Dict[str, Any], backup: bool = True) -> Dict[str, Any]:
     return panel
 
 
+def save_panel(panel: Dict[str, Any], backup: bool = True) -> Dict[str, Any]:
+    with panel_file_lock():
+        return _save_panel_unlocked(panel, backup=backup)
+
+
 def mutate_panel(mutator):
-    panel = load_panel()
-    updated = mutator(panel)
-    return save_panel(panel if updated is None else updated)
+    with panel_file_lock():
+        panel = load_panel()
+        updated = mutator(panel)
+        return _save_panel_unlocked(panel if updated is None else updated)
 
 
 def _default_task_view(task_id: str) -> Dict[str, Any]:
@@ -449,6 +543,19 @@ def ack_outbox_event(event_id: str) -> None:
         path.unlink()
     except FileNotFoundError:
         pass
+
+
+def update_outbox_event(event_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    path = get_outbox_dir() / f"{str(event_id).strip()}.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload.update(patch)
+    _atomic_write_json(path, payload)
+    return payload
 
 
 def emit_task_event(payload: Dict[str, Any]) -> Dict[str, Any]:

@@ -47,7 +47,9 @@ try:
         list_task_events,
         load_plans,
         now_iso,
+        panel_file_lock,
         parse_iso,
+        prune_panel_backups,
         queue_outbound_message,
         refresh_conversation_context_file,
         save_plans,
@@ -55,6 +57,7 @@ try:
         _short_text,
         slugify,
         update_conversation_task,
+        update_outbox_event,
     )
 except ImportError:
     from tool_runtime_helpers import (
@@ -71,7 +74,9 @@ except ImportError:
         list_task_events,
         load_plans,
         now_iso,
+        panel_file_lock,
         parse_iso,
+        prune_panel_backups,
         queue_outbound_message,
         refresh_conversation_context_file,
         save_plans,
@@ -79,10 +84,11 @@ except ImportError:
         _short_text,
         slugify,
         update_conversation_task,
+        update_outbox_event,
     )
 
 try:
-    import fcntl
+    import fcntl  # noqa: F401  (kept for import-compat; locking now lives in tool_runtime_helpers.panel_file_lock)
 except ImportError:  # pragma: no cover
     fcntl = None
 
@@ -157,6 +163,10 @@ def _load_cheapclaw_app_config_example() -> Dict[str, Any]:
         },
         "cheapclaw": {
             "watchdog_interval_sec": 10800,
+            "supervisor_timeout_sec": 900,
+            "outbox_max_retries": 10,
+            "outbox_backoff_base_sec": 30,
+            "outbox_backoff_cap_sec": 900,
             "default_exposed_skills": ["docx", "pptx", "xlsx", "find-skills"],
             "default_mcp_servers": [],
             "feishu_mode": "long_connection",
@@ -179,6 +189,10 @@ def _extract_cheapclaw_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
         default_mcp_servers = list(example_cheapclaw.get("default_mcp_servers", []))
     return {
         "watchdog_interval_sec": max(60, int(cheapclaw.get("watchdog_interval_sec", example_cheapclaw.get("watchdog_interval_sec", 10800)) or example_cheapclaw.get("watchdog_interval_sec", 10800))),
+        "supervisor_timeout_sec": max(0, int(cheapclaw.get("supervisor_timeout_sec", example_cheapclaw.get("supervisor_timeout_sec", 900)) or 0)),
+        "outbox_max_retries": max(1, int(cheapclaw.get("outbox_max_retries", example_cheapclaw.get("outbox_max_retries", 10)) or 10)),
+        "outbox_backoff_base_sec": max(1, int(cheapclaw.get("outbox_backoff_base_sec", example_cheapclaw.get("outbox_backoff_base_sec", 30)) or 30)),
+        "outbox_backoff_cap_sec": max(1, int(cheapclaw.get("outbox_backoff_cap_sec", example_cheapclaw.get("outbox_backoff_cap_sec", 900)) or 900)),
         "default_exposed_skills": [str(item).strip() for item in default_skills if str(item).strip()],
         "default_mcp_servers": [item for item in default_mcp_servers if isinstance(item, dict)],
         "feishu_mode": str(cheapclaw.get("feishu_mode", example_cheapclaw.get("feishu_mode", "long_connection")) or example_cheapclaw.get("feishu_mode", "long_connection")).strip(),
@@ -289,27 +303,21 @@ class CheapClawPanelStore:
     def _file_lock(self):
         self.paths.panel_dir.mkdir(parents=True, exist_ok=True)
         with self._thread_lock:
-            with open(self.paths.panel_lock_path, "a+", encoding="utf-8") as lock_file:
-                if fcntl is not None:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    if fcntl is not None:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            with panel_file_lock(self.paths.panel_lock_path):
+                yield
 
     def load_panel(self) -> Dict[str, Any]:
         return self._normalize_panel(_load_json(self.paths.panel_path, {"version": 1, "channels": {}, "service_state": {}}))
 
     def save_panel(self, panel: Dict[str, Any], *, backup: bool = True) -> Dict[str, Any]:
-        normalized = self._normalize_panel(panel)
         with self._file_lock():
+            normalized = self._normalize_panel(panel)
             self._write_panel_locked(normalized, backup=backup)
         return normalized
 
     def mutate(self, updater: Callable[[Dict[str, Any]], Dict[str, Any] | None]) -> Dict[str, Any]:
         with self._file_lock():
-            current = self.load_panel()
+            current = self._normalize_panel(_load_json(self.paths.panel_path, {"version": 1, "channels": {}, "service_state": {}}))
             updated = updater(current)
             panel = current if updated is None else updated
             normalized = self._normalize_panel(panel)
@@ -319,8 +327,9 @@ class CheapClawPanelStore:
     def _write_panel_locked(self, panel: Dict[str, Any], *, backup: bool) -> None:
         if backup and self.paths.panel_path.exists():
             backup_path = self.paths.panel_backups_dir / f"panel_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
-            backup_path.write_text(self.paths.panel_path.read_text(encoding="utf-8"), encoding="utf-8")
+            _atomic_write_text(backup_path, self.paths.panel_path.read_text(encoding="utf-8"))
             panel.setdefault("service_state", {})["last_backup_path"] = str(backup_path)
+            prune_panel_backups(keep=50, backups_dir=self.paths.panel_backups_dir)
         _atomic_write_text(self.paths.panel_path, json.dumps(panel, ensure_ascii=False, indent=2))
 
     def _normalize_panel(self, panel: Dict[str, Any]) -> Dict[str, Any]:
@@ -1114,9 +1123,14 @@ class CheapClawService:
         self.app_skills_root = APP_SKILLS_ROOT.resolve()
         self._supervisor_lock = threading.Lock()
         self.watchdog_interval_sec = max(60, int(watchdog_interval_sec or cheapclaw_settings["watchdog_interval_sec"]))
+        self.supervisor_timeout_sec = cheapclaw_settings["supervisor_timeout_sec"]
+        self.outbox_max_retries = cheapclaw_settings["outbox_max_retries"]
+        self.outbox_backoff_base_sec = cheapclaw_settings["outbox_backoff_base_sec"]
+        self.outbox_backoff_cap_sec = cheapclaw_settings["outbox_backoff_cap_sec"]
         self.adapters: Dict[str, ChannelAdapter] = {}
         self.bootstrap_assets(force=False)
         self.reload_adapters()
+        self._clear_stale_main_agent_flag()
         ACTIVE_SERVICE = self
         _log(
             f"service initialized: user_data_root={runtime['user_data_root']} "
@@ -1127,6 +1141,14 @@ class CheapClawService:
     def _runtime_scope(self):
         with self.sdk._runtime_scope():
             yield
+
+    def _clear_stale_main_agent_flag(self) -> None:
+        # 在本进程启动时刻不可能存在存活的 supervisor run；若 panel 仍标记
+        # running，说明上次进程在 run 中途崩溃，直接复位，避免状态永久残留。
+        panel = self.panel_store.load_panel()
+        if panel.get("service_state", {}).get("main_agent_running"):
+            self.panel_store.set_main_agent_state(running=False)
+            _log("cleared stale main_agent_running flag left by a previous process")
 
     def bootstrap_assets(self, force: bool = False) -> Dict[str, Any]:
         runtime = self.sdk.describe_runtime()
@@ -1293,9 +1315,47 @@ class CheapClawService:
             return generate_task_id(channel, conversation_id, task_name)
 
     def build_task_skills_overlay(self, *, task_id: str, exposed_skills: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        resolved_task_id = str(Path(task_id).expanduser().resolve())
         with self._runtime_scope():
-            payload = set_task_visible_skills(task_id, exposed_skills or [])
-        return {"status": "success", **payload}
+            visible_payload = set_task_visible_skills(resolved_task_id, exposed_skills or [])
+            revealed = [str(item).strip() for item in (visible_payload.get("visible_skills") or []) if str(item).strip()]
+            overlay_root = self.paths.task_skills_root / f"{slugify(Path(resolved_task_id).name, fallback='task')}_{hashlib.sha256(resolved_task_id.encode('utf-8')).hexdigest()[:10]}"
+            overlay_root.mkdir(parents=True, exist_ok=True)
+            skills_root = Path(str(self.runtime.get("skills_dir") or "")).expanduser() if self.runtime.get("skills_dir") else Path()
+            copied: List[str] = []
+            missing: List[str] = []
+            for skill_name in revealed:
+                source_dir = skills_root / skill_name
+                if not skills_root or not source_dir.is_dir():
+                    missing.append(skill_name)
+                    continue
+                target_dir = overlay_root / skill_name
+                try:
+                    shutil.copytree(source_dir, target_dir, dirs_exist_ok=True)
+                    copied.append(skill_name)
+                except Exception:
+                    missing.append(skill_name)
+            manifest = {
+                "task_id": resolved_task_id,
+                "revealed_skills": revealed,
+                "copied_skills": copied,
+                "missing_skills": missing,
+                "skills_root": str(skills_root) if skills_root else "",
+                "activation": "visible_skills",
+                "created_at": now_iso(),
+            }
+            _atomic_write_text(overlay_root / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            return {
+                "status": "success",
+                "task_id": resolved_task_id,
+                "overlay_root": str(overlay_root),
+                "manifest_path": str(overlay_root / "manifest.json"),
+                "revealed_skills": revealed,
+                "copied_skills": copied,
+                "missing_skills": missing,
+                "visible_skills": revealed,
+                "updated_at": visible_payload.get("updated_at", now_iso()),
+            }
 
     def record_social_message(self, **kwargs) -> Dict[str, Any]:
         with self._runtime_scope():
@@ -1370,7 +1430,7 @@ class CheapClawService:
             if result.get("status") != "success":
                 return result
             snapshot = self.sdk.task_snapshot(task_id=resolved_task_id)
-            set_task_visible_skills(resolved_task_id, exposed_skills or [])
+            overlay_result = self.build_task_skills_overlay(task_id=resolved_task_id, exposed_skills=exposed_skills or [])
             latest_instruction = snapshot.get("latest_instruction") or {}
             if not isinstance(latest_instruction, dict):
                 latest_instruction = {}
@@ -1385,7 +1445,7 @@ class CheapClawService:
                     "share_context_path": snapshot.get("share_context_path", ""),
                     "stack_path": snapshot.get("stack_path", ""),
                     "log_path": result.get("log_path", ""),
-                    "skills_dir": "",
+                    "skills_dir": str(overlay_result.get("overlay_root") or ""),
                     "default_exposed_skills": list(exposed_skills or []),
                     "mcp_servers": list(merged_config.get("mcp_servers") or []),
                     "last_thinking": snapshot.get("latest_thinking", ""),
@@ -1671,14 +1731,43 @@ class CheapClawService:
             "conversation_id": str(conversation_id),
         }
 
+    def _outbox_backoff_sec(self, retry_count: int) -> int:
+        return min(self.outbox_backoff_cap_sec, self.outbox_backoff_base_sec * max(1, int(retry_count)))
+
+    def _record_outbox_failure(self, event: Dict[str, Any], error: str) -> Dict[str, Any]:
+        event_id = str(event.get("event_id") or "")
+        retry_count = int(event.get("retry_count") or 0) + 1
+        patch = {
+            "retry_count": retry_count,
+            "last_attempt_at": now_iso(),
+            "last_error": _short_text(str(error), limit=500),
+        }
+        if retry_count >= self.outbox_max_retries:
+            patch["status"] = "dead"
+            patch["dead_at"] = now_iso()
+        update_outbox_event(event_id, patch)
+        return {
+            "event_id": event_id,
+            "status": patch.get("status", "retry"),
+            "retry_count": retry_count,
+            "max_retries": self.outbox_max_retries,
+            "error": str(error),
+        }
+
     def process_outbox(self) -> List[Dict[str, Any]]:
         with self._runtime_scope():
             results = []
             for event in list_outbox_events():
+                if str(event.get("status") or "") == "dead":
+                    continue
                 channel = str(event.get("channel") or "").strip()
+                retry_count = int(event.get("retry_count") or 0)
+                last_attempt = parse_iso(str(event.get("last_attempt_at") or ""))
+                if last_attempt and last_attempt > datetime.now().astimezone() - timedelta(seconds=self._outbox_backoff_sec(retry_count)):
+                    continue
                 adapter = self.adapters.get(channel)
                 if adapter is None:
-                    results.append({"event_id": event.get("event_id"), "status": "error", "error": f"adapter not configured: {channel}"})
+                    results.append(self._record_outbox_failure(event, f"adapter not configured: {channel}"))
                     continue
                 ok, remote_id = adapter.send_message(str(event.get("conversation_id") or ""), str(event.get("message") or ""), event.get("attachments") or [])
                 if ok:
@@ -1699,7 +1788,7 @@ class CheapClawService:
                     )
                     results.append({"event_id": event.get("event_id"), "status": "success", "remote_id": remote_id})
                 else:
-                    results.append({"event_id": event.get("event_id"), "status": "error", "error": remote_id})
+                    results.append(self._record_outbox_failure(event, str(remote_id)))
             return results
 
     def poll_channels(self) -> List[Dict[str, Any]]:
@@ -1799,12 +1888,13 @@ class CheapClawService:
                 channel = str(plan.get("channel") or "").strip()
                 conversation_id = str(plan.get("conversation_id") or "").strip()
                 if channel and conversation_id:
-                    panel = load_panel()
-                    conv = ensure_conversation(panel, channel=channel, conversation_id=conversation_id)
-                    conv.setdefault("pending_events", []).append({"type": "plan_tick", "plan_id": plan.get("plan_id"), "timestamp": now_iso(), "message": str(plan.get("message") or "")})
-                    conv["dirty"] = True
-                    panel.setdefault("service_state", {})["main_agent_dirty"] = True
-                    save_panel(panel)
+                    def _queue_plan_tick(panel: Dict[str, Any]) -> Dict[str, Any]:
+                        conv = ensure_conversation(panel, channel=channel, conversation_id=conversation_id)
+                        conv.setdefault("pending_events", []).append({"type": "plan_tick", "plan_id": plan.get("plan_id"), "timestamp": now_iso(), "message": str(plan.get("message") or "")})
+                        conv["dirty"] = True
+                        panel.setdefault("service_state", {})["main_agent_dirty"] = True
+                        return panel
+                    self.panel_store.mutate(_queue_plan_tick)
                 plan["last_result"] = "queued main_agent tick"
             plan["last_run_at"] = now_iso()
             schedule_type = str(plan.get("schedule_type") or "").strip()
@@ -1888,13 +1978,67 @@ class CheapClawService:
                     "summary": str(event.get("message") or event.get("note") or event.get("suspected_state") or "")[:240],
                 })
 
+            inbound_messages = [
+                item for item in messages
+                if str(item.get("direction") or "inbound") != "outbound"
+            ]
+            latest_user_message = inbound_messages[-1] if inbound_messages else {}
+            pending_user_messages = [
+                {
+                    "message_id": str(item.get("message_id") or ""),
+                    "timestamp": str(item.get("timestamp") or ""),
+                    "text": _short_text(str(item.get("text") or ""), limit=360),
+                }
+                for item in new_user_messages
+            ]
+            recent_texts = [
+                _short_text(str(item.get("text") or ""), limit=120)
+                for item in inbound_messages[-3:]
+            ]
+            referenced_task_ids = []
+            for item in conv.get("linked_tasks", []):
+                candidate = str(item.get("task_id") or "")
+                if candidate and candidate not in referenced_task_ids:
+                    referenced_task_ids.append(candidate)
+            for item in task_events:
+                candidate = str(item.get("task_id") or "")
+                if candidate and candidate not in referenced_task_ids:
+                    referenced_task_ids.append(candidate)
+            excerpt_parts = [f"{conv.get('display_name') or conv.get('conversation_id')}({conv.get('conversation_type') or 'group'})"]
+            if recent_texts:
+                excerpt_parts.append("最近消息: " + " | ".join(text for text in recent_texts if text))
+            if referenced_task_ids:
+                excerpt_parts.append("相关任务: " + ", ".join(referenced_task_ids[:5]))
+            context_excerpt = _short_text("；".join(part for part in excerpt_parts if part), limit=600)
             summaries.append({
                 "channel": conv.get("channel"),
                 "conversation_id": conv.get("conversation_id"),
                 "display_name": conv.get("display_name"),
                 "conversation_type": conv.get("conversation_type"),
+                "latest_user_message": {
+                    "message_id": str(latest_user_message.get("message_id") or ""),
+                    "timestamp": str(latest_user_message.get("timestamp") or ""),
+                    "text": str(latest_user_message.get("text") or ""),
+                } if latest_user_message else {},
+                "pending_user_messages": pending_user_messages,
                 "new_user_messages": new_user_messages,
                 "task_events": task_events,
+                "pending_events": [
+                    {
+                        "type": str(event.get("type") or ""),
+                        "message_id": str(event.get("message_id") or ""),
+                        "task_id": str(event.get("task_id") or ""),
+                        "timestamp": str(event.get("timestamp") or ""),
+                    }
+                    for event in pending_events[:20]
+                ],
+                "context_excerpt": context_excerpt,
+                "lookup_hints": {
+                    "panel": "cheapclaw_read_panel",
+                    "history": "cheapclaw_read_social_history",
+                    "conversation_tasks": "cheapclaw_list_conversation_tasks",
+                    "task_status": "cheapclaw_get_task_status",
+                },
             })
         payload = {
             "trigger_reason": reason,
@@ -1915,19 +2059,43 @@ class CheapClawService:
             self.panel_store.save_panel(panel)
             return {"status": "busy", "output": "supervisor already running"}
         run_id = f"sup_{uuid.uuid4().hex[:10]}"
-        try:
-            self.panel_store.set_main_agent_state(running=True, run_id=run_id)
-            result = self.sdk.run(
-                self._build_supervisor_input(reason),
-                task_id=str(self.paths.supervisor_task_id),
-                agent_system=self.supervisor_agent_system,
-                agent_name=self.supervisor_agent_name,
-                force_new=False,
-            )
-            return result
-        finally:
-            self.panel_store.set_main_agent_state(running=False)
-            self._supervisor_lock.release()
+        holder: Dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                self.panel_store.set_main_agent_state(running=True, run_id=run_id)
+                holder["result"] = self.sdk.run(
+                    self._build_supervisor_input(reason),
+                    task_id=str(self.paths.supervisor_task_id),
+                    agent_system=self.supervisor_agent_system,
+                    agent_name=self.supervisor_agent_name,
+                    force_new=False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                holder["error"] = exc
+                _log(f"supervisor run {run_id} crashed: {exc}\n{traceback.format_exc()}")
+            finally:
+                # 无论正常结束还是崩溃都复位状态并释放锁；若主循环已按超时
+                # 返回，这里就是唯一的收尾路径，之后下一轮 cycle 可再次触发。
+                self.panel_store.set_main_agent_state(running=False)
+                self._supervisor_lock.release()
+
+        worker = threading.Thread(target=_run, daemon=True, name=f"cheapclaw-supervisor-{run_id}")
+        worker.start()
+        timeout = self.supervisor_timeout_sec
+        worker.join(timeout if timeout > 0 else None)
+        if worker.is_alive():
+            # 不强杀线程（Python 无法安全终止）；锁仍由 worker 持有，期间
+            # 新触发会得到 busy，主循环继续轮询/watchdog，不再整体停摆。
+            _log(f"supervisor run {run_id} exceeded timeout {timeout}s; leaving it to finish in background")
+            return {
+                "status": "timeout",
+                "run_id": run_id,
+                "output": f"supervisor run still executing after {timeout}s; service loop continues",
+            }
+        if "error" in holder:
+            return {"status": "error", "run_id": run_id, "output": "", "error": str(holder["error"])}
+        return holder.get("result", {"status": "error", "run_id": run_id, "output": "", "error": "supervisor run produced no result"})
 
     def run_once(self) -> Dict[str, Any]:
         polled = self.poll_channels()

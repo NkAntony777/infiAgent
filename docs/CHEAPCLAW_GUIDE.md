@@ -179,8 +179,12 @@ Webhook：
 python apps/cheapclaw/cheapclaw_service.py \
   --user-data-root /abs/path/to/user_root \
   --llm-config-path /abs/path/to/llm_config.yaml \
-  --serve-webhooks --host 0.0.0.0 --port 8787
+  --serve-webhooks --host 127.0.0.1 --port 8787
 ```
+
+注意：webhook 服务和看板默认没有鉴权，`--host` 建议保持 `127.0.0.1`，
+仅通过反向代理（在代理层做 TLS 和鉴权）对外暴露；直接绑定 `0.0.0.0`
+会把面板 API 和渠道回调入口暴露给公网。
 
 看板：
 - 启动 HTTP 服务后，浏览器打开 `http://127.0.0.1:8787/dashboard`
@@ -206,6 +210,13 @@ CheapClaw 不默认依赖 `final_output` hook 更新 panel。
 
 默认 watchdog 周期：
 - `10800` 秒，也就是 3 小时
+
+## 8.1 长跑健壮性行为
+
+- 主 agent run 在独立线程中执行，受 `cheapclaw.supervisor_timeout_sec`（默认 900 秒）约束；超时后主循环继续轮询/watchdog，不会整体停摆，新的触发会得到 `busy`，直到滞留的 run 自行结束并释放锁。
+- 服务进程重启时会自动清除 panel 中残留的 `main_agent_running` 标志。
+- panel 写入统一走跨进程文件锁（Windows 用 `msvcrt.locking`，POSIX 用 `fcntl.flock`），`panel.json` 及备份均为原子写；备份按时间戳轮转，默认保留最近 50 份。
+- outbox 发送失败按 `retry_count` 指数退避（`outbox_backoff_base_sec` 起步、`outbox_backoff_cap_sec` 封顶），超过 `outbox_max_retries` 后事件标记为 `dead`，不再重试。
 
 ## 9. 外移到独立项目
 
